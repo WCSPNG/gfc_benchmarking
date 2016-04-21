@@ -1,0 +1,233 @@
+##### FUNCTION ###########
+gfc_benchmarking <- function(aoi_folder, hansen_folder,output_folder,threshold,inverse.extent ) {
+
+require(gfcanalysis)
+require(raster)
+require(rgdal)
+require(rgeos)
+require(geosphere)
+require(sp)
+require(plyr)
+require(dplyr)
+require(ggplot2)
+require(stringr)
+require(scales)
+
+rm(list=ls())
+
+
+# List AOI shapefiles
+# makes list of shape files of only shp
+ file_root <- aoi_folder 
+ file_list <- list.files(aoi_folder,pattern = "*.shp$")
+ layername <- str_sub(file_list,end=-5)
+
+# length of file list
+ loop_length <- length(file_list)
+
+# thresholding list or singular rule
+# threshold check
+# check length
+reps <- ifelse(length(threshold)==1,loop_length ,1)
+
+# rep for all
+threshold_values <- rep(threshold,reps)
+
+# error message if threshold values wrong
+try(if(length(threshold_values) != loop_length)  stop("incorrect number of threshold values"))
+
+
+##### loop beings here ##########
+
+for (i in 1:length(file_list)){
+
+
+
+# reading in singular layer for AOI
+aoi<- readOGR(file_root, layername[i])
+
+# quick check
+plot(aoi)
+
+# assign UTM projection to map grid
+my.crs <- paste("+proj=longlat")
+
+# transform CRS to longlat - automatic
+aoi<-spTransform(aoi, CRS(my.crs))
+
+
+########## gfcanalysis
+
+# check title and aoi overlay
+tiles <- calc_gfc_tiles(aoi)
+plot(tiles)
+plot(aoi, add=TRUE, lty=2, col="#00ff0050")
+
+# stipulate forest threshold
+gfc_extract <- extract_gfc(aoi, hansen_folder)
+thres_extract <- threshold_gfc(gfc_extract, forest_threshold = threshold_values[i])
+
+plot(thres_extract)
+
+# masking to AOI
+a <- raster(extent(thres_extract))
+res(a) <- res(thres_extract)
+aoi.raster <-rasterize(aoi, a)
+
+plot(aoi.raster)
+
+
+# normal mask
+aoi.mask <- mask(thres_extract,aoi.raster, inverse =inverse.extent)
+forest.data <- unstack(aoi.mask)
+loss <- forest.data[[2]] 
+
+plot(loss)
+
+
+### PIXEL SIZE ####
+
+# calc_pixel_areas from gfcanalysis
+
+calc_pixel_areas <- function(x) {
+    # Construct polygons for a single column of the raster
+    xleft <- xmin(x)
+    xright <- xmin(x) + xres(x)
+    # Note that ylower and yupper are setup so that the polygons are ordered
+    # from high latitude to lowest latitude - needed because rasters are 
+    # addressed starting from the upper left corner (highest latitude)
+    ylower <- seq(from=(ymax(x) - yres(x)), by=(-yres(x)), length.out=nrow(x))
+    yupper <- seq(from=ymax(x), by=(-yres(x)), length.out=nrow(x))
+    poly_areas <- function(xl, xr, yl, yu) {
+        areaPolygon(matrix(c(xl, yl,
+                             xr, yl,
+                             xr, yu,
+                             xl, yu), ncol=2, byrow=TRUE))
+    }
+    pixel_areas <- mapply(poly_areas, xleft, xright, ylower, yupper)
+}
+
+# calculating pixel size
+area <-calc_pixel_areas(loss)
+
+	# number of columns of raster
+	loss@ncols
+
+	# change to matrix
+	area <- as.matrix(area)
+
+	# repeat cols x times
+	area.m <- area[,rep(1, loss@ncols)]
+
+	# change to transverse vector
+	area.v <- as.vector(t(area.m ))
+
+plot(aoi.raster, col="red")
+
+# change raster to data frame
+
+# change to raster must use whole extent
+
+z <-as.data.frame(rasterToPoints(loss))
+x <-as.data.frame(rasterToPoints(thres_extract))
+
+dim(z)
+
+# add in area column (from transverse vector)
+x$area <- area.v/10000
+
+# give id for merging
+z$id = paste(z$x,z$y)
+x$id = paste(x$x,x$y)
+
+
+# joining so only affected pixels recorded
+final.aoi.df <-join(x, z, by = "id", type = "inner", match="all")
+
+
+# change loss year to factor
+final.aoi.df$lossyear <- final.aoi.df$lossyear +2000
+final.aoi.df$lossyear <- as.factor(final.aoi.df$lossyear)
+final.aoi.df <-final.aoi.df[,1:8]
+final.aoi.df$original.area <- final.aoi.df$area *final.aoi.df$forest2000
+
+# total forest area
+forested.area <- sum(final.aoi.df$original.area)
+
+
+# summary by year affected cells
+table(final.aoi.df$lossyear)
+
+plot(aoi.raster, col="blue")
+
+
+#  grouping and finalising area affected
+Output <-final.aoi.df %>%
+    group_by(lossyear) %>%
+    summarise_each(funs(sum), area)
+
+
+Output <- Output[-1,]
+Output$lossyear <- as.numeric(as.character(Output$lossyear))
+Output$percentage <- (Output$area/forested.area) *100
+
+
+plot(aoi.raster, col="green")
+
+# ggplot
+  
+comma_format()(1000000)
+value <- ceiling(forested.area)
+value <- prettyNum(c(value),big.mark=",")  # adds comma
+
+subtitle <- paste("forest area @ ",threshold_values[i], "% threshold = ", value," ha", sep="" )
+context <- ifelse(inverse.extent==FALSE, " from original AOI raster", " from outside AOI but within extent")
+title <- paste(layername[i],  context, sep="")
+
+graph <-ggplot()+
+geom_point(data=Output, aes(x=as.numeric(lossyear), y=percentage), size=3)+
+geom_smooth(data=Output, aes(x=as.numeric(lossyear), y=percentage), colour="black", size=2)+
+scale_x_continuous(breaks = c(2001:2014))+
+theme_bw()+
+ylab("% forest loss")+
+ggtitle(bquote(atop(bold(.(title)), atop(italic(.(subtitle)), ""))))+
+theme(axis.title.x =element_text (face=2, size=14,vjust=0.5))+
+theme(axis.title.y=element_text (face=2, size=12,vjust=1))+
+theme(plot.title = element_text(size=15, face="bold"))+
+xlab("year of loss")
+
+graph
+
+plot(aoi.raster, col="blue")
+
+
+# save output 
+Output$threshold <- threshold
+Output$aoi <- layername[i]
+Output$analysis <- title
+
+# write csv file
+output.file <- paste(output_folder,"\\",title,".csv", sep="")
+write.csv(Output, file = output.file, row.names=FALSE)
+
+# save ggplot
+graphics.file <- paste(output_folder,"\\",title,".tiff", sep="")
+ggsave(graph, file=graphics.file, scale=1)
+
+# PRINT COMPLETE
+writeLines(paste("\n",i, "/", length(file_list)," AOI shapefiles processed\n", sep=""))
+
+}
+}
+
+
+# FUNCTION TEST
+
+hansen_folder <- "C:\\Users\\WCS\\Documents\\Benchmarking" 
+aoi_folder <-  "C:\\Users\\WCS\\Desktop\\Test shapefiles"
+output_folder <- "C:\\Users\\WCS\\Desktop\\check files"
+threshold <- 85
+inverse.extent <-FALSE
+
+
+gfc_benchmarking(aoi_folder, hansen_folder,output_folder,threshold,inverse.extent)
